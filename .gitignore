@@ -1,0 +1,6 @@
+.env
+.exa_cache.json
+.venv/
+__pycache__/
+targets*.csv
+targets_today*.md
