@@ -58,15 +58,27 @@ Options:
 --limit N     Maximum company candidates to enrich (default: 5)
 --days N      Recent-signal lookback period (default: 60)
 --refresh     Ignore cached API responses
+--include-seen Bypass the early name-only filter; duplicates are still rejected
 --out-dir DIR Output directory (default: current directory)
 ```
 
-Each run writes uniquely timestamped files such as
-`targets_today_20261120_152345_123456.md` (company dossiers, introductions,
-recent signals, funding stage/amount/date/source, Google verification links,
-target-fit tiers, and four-sentence outreach drafts) and
-`targets_20261120_152345_123456.csv` (company, funding, lead, fit-tier, draft,
-and verification-link fields), so earlier runs are preserved.
+`targets_master.csv` in the output directory is the persistent source of truth
+for target deduplication. On first run only, if the master file does not exist,
+the CLI migrates and deduplicates existing `targets*.csv` files into it. Existing
+master-sheet columns and manually edited values (such as status or notes) are
+preserved when new rows are appended; writes use a temporary file and atomic
+replacement. New rows include `discovered_date` and a default `status` of `New`.
+
+Each run that finds new companies also writes a uniquely timestamped Markdown
+dossier, for example `targets_today_20261120_152345_123456.md`, containing only
+those new targets. No Markdown file is created when there are no new targets;
+no per-run CSV is written.
+
+By default, known company names are filtered before enrichment to save Exa calls.
+After enrichment, both canonical company name and normalized domain are checked
+against the master sheet and this run's additions before lead lookup. The
+`--include-seen` flag bypasses the early name-only filter, but master/domain
+deduplication still prevents duplicate rows and lead lookups.
 Candidate enrichment continues until the requested number of targets is found
 or at most `3 × --limit` candidates have been attempted.
 
@@ -102,10 +114,10 @@ Would you be open to a brief conversation next week?
 
 ## Cost and latency
 
-The uncached upper bound is three discovery searches plus up to three searches
+The uncached upper bound is five discovery searches plus up to three searches
 (recent funding, careers/company, and leads) for each of at most
-`3 × --limit` candidate attempts (`3 + 9 × --limit`), so the default run is at
-most 48 Exa calls. Failed enrichments may use fewer calls, and cache hits use
+`3 × --limit` candidate attempts (`5 + 9 × --limit`), so the default run is at
+most 50 Exa calls. Failed enrichments may use fewer calls, and cache hits use
 none. `--refresh` can increase API usage; use a smaller `--limit` while testing.
 Exa pricing and latency depend on the account, query type, and current service
 plan—check Exa's current pricing before scaling. Calls run sequentially to keep

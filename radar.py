@@ -14,7 +14,7 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 
 from dotenv import load_dotenv
 from exa_py import Exa
@@ -59,6 +59,10 @@ DISCOVERY_QUERIES = (
     "hiring at AI, developer tools, or fintech startups.",
     "Recent founder, CTO, or engineering leadership hiring announcements at fast-growing "
     "AI, developer tools, or fintech startups with Singapore presence.",
+    "Y Combinator, Sequoia, or Lightspeed-backed AI and fintech startups hiring "
+    "software engineers in Singapore or across remote APAC.",
+    "YC, Sequoia, and Lightspeed portfolio startups in AI or fintech expanding "
+    "engineering teams in Singapore, APAC, or remote-first roles.",
 )
 
 DISCOVERY_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -179,6 +183,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--refresh", action="store_true", help="ignore cached responses and fetch fresh results"
+    )
+    parser.add_argument(
+        "--include-seen",
+        action="store_true",
+        help="enrich candidate names already in the master sheet (duplicates remain excluded)",
     )
     parser.add_argument(
         "--out-dir",
@@ -341,7 +350,15 @@ def _company_names(payload: dict[str, Any]) -> list[str]:
     names = structured.get("companies", []) if isinstance(structured, dict) else []
     if not isinstance(names, list):
         return []
-    return [name.strip() for name in names if isinstance(name, str) and name.strip()]
+    cleaned = (_clean_candidate_name(name) for name in names if isinstance(name, str))
+    return [name for name in cleaned if name]
+
+
+def _clean_candidate_name(value: str) -> str:
+    name = re.sub(r"\([^)]*\)", " ", value)
+    name = re.sub(r"\[\s*\d+\s*\]", " ", name)
+    name = re.sub(r"\s+", " ", name)
+    return name.strip(" \t\r\n,;:-")
 
 
 def _normalize_company_name(name: str) -> str:
@@ -368,7 +385,7 @@ def discover_candidates(
                 query,
                 type="auto",
                 category="news",
-                num_results=8,
+                num_results=12,
                 exclude_domains=EXCLUDED_DOMAINS,
                 start_published_date=start_date,
                 contents={"highlights": {"max_characters": 600}, "max_age_hours": 24},
@@ -874,41 +891,197 @@ CSV_FIELDS = [
     "lead_2_name",
     "lead_2_url",
     "lead_2_highlight",
+    "discovered_date",
+    "status",
 ]
 
 
-def write_csv(targets: list[dict[str, Any]], path: Path) -> None:
-    with path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
-        writer.writeheader()
-        for target in targets:
-            company: CompanyEnrichment = target["company"]
-            row: dict[str, Any] = {
-                "company_name": company.company_name,
-                "domain": company.domain,
-                "company_intro": company.company_intro,
-                "funding_stage": company.funding_stage,
-                "latest_funding_date": company.latest_funding_date,
-                "funding_amount": company.funding_amount,
-                "funding_source_url": company.funding_source_url,
-                "sg_presence": company.sg_presence,
-                "hiring_roles": ", ".join(company.hiring_roles),
-                "careers_url": company.careers_url,
-                "why_now_hook": company.why_now_hook,
-                "freshness_check_url": _google_freshness_url(company.company_name),
-                "target_fit": target["fit_tier"],
-                "cold_email_draft": _email_draft(company, target["leads"]),
-            }
-            for index in range(2):
-                lead = target["leads"][index] if index < len(target["leads"]) else {}
-                row.update(
-                    {
-                        f"lead_{index + 1}_name": lead.get("name", ""),
-                        f"lead_{index + 1}_url": lead.get("url", ""),
-                        f"lead_{index + 1}_highlight": lead.get("highlight", ""),
+COMPANY_SUFFIXES = {
+    "pte",
+    "ltd",
+    "limited",
+    "inc",
+    "incorporated",
+    "llc",
+    "corp",
+    "corporation",
+    "co",
+}
+
+
+def canonical_company_name(value: Any) -> str:
+    name = _string_value(value).casefold()
+    name = re.sub(r"\([^)]*\)", " ", name)
+    name = re.sub(r"\[\s*\d+\s*\]", " ", name)
+    tokens = re.findall(r"[a-z0-9]+", name)
+    while tokens and tokens[-1] in COMPANY_SUFFIXES:
+        tokens.pop()
+    return " ".join(tokens)
+
+
+def normalize_domain(value: Any) -> str:
+    domain = _string_value(value).casefold()
+    if not domain:
+        return ""
+    parsed = urlsplit(domain if "://" in domain else f"//{domain}")
+    hostname = (parsed.hostname or "").rstrip(".")
+    if hostname.startswith("www."):
+        hostname = hostname[4:]
+    return hostname
+
+
+def _row_identities(row: dict[str, Any]) -> tuple[str, str]:
+    return canonical_company_name(row.get("company_name")), normalize_domain(row.get("domain"))
+
+
+def _add_row_to_index(
+    row: dict[str, Any], names: set[str], domains: set[str]
+) -> None:
+    name, domain = _row_identities(row)
+    if name:
+        names.add(name)
+    if domain:
+        domains.add(domain)
+
+
+def _matches_index(
+    name: Any, domain: Any, names: set[str], domains: set[str]
+) -> bool:
+    normalized_name = canonical_company_name(name)
+    normalized_domain = normalize_domain(domain)
+    return bool(
+        (normalized_name and normalized_name in names)
+        or (normalized_domain and normalized_domain in domains)
+    )
+
+
+def _ensure_master_columns(fieldnames: list[str], rows: list[dict[str, str]]) -> list[str]:
+    fields = list(fieldnames)
+    for field in CSV_FIELDS:
+        if field not in fields:
+            fields.append(field)
+    for row in rows:
+        row.setdefault("discovered_date", "")
+        row.setdefault("status", "New")
+    return fields
+
+
+def load_master_sheet(master_path: Path) -> tuple[list[dict[str, str]], list[str], bool]:
+    rows: list[dict[str, str]] = []
+    fieldnames: list[str] = []
+    created = not master_path.exists()
+
+    if not created:
+        with master_path.open("r", encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            fieldnames = list(reader.fieldnames or [])
+            rows = [
+                {key: value or "" for key, value in row.items() if key is not None}
+                for row in reader
+            ]
+        updated_fields = _ensure_master_columns(fieldnames, rows)
+        return rows, updated_fields, updated_fields != fieldnames
+
+    imported_names: set[str] = set()
+    imported_domains: set[str] = set()
+    for legacy_path in sorted(master_path.parent.glob("targets*.csv")):
+        if legacy_path.resolve() == master_path.resolve():
+            continue
+        try:
+            with legacy_path.open("r", encoding="utf-8-sig", newline="") as handle:
+                reader = csv.DictReader(handle)
+                legacy_fields = list(reader.fieldnames or [])
+                for field in legacy_fields:
+                    if field not in fieldnames:
+                        fieldnames.append(field)
+                for raw_row in reader:
+                    row = {
+                        key: value or ""
+                        for key, value in raw_row.items()
+                        if key is not None
                     }
-                )
-            writer.writerow(row)
+                    if _matches_index(
+                        row.get("company_name"),
+                        row.get("domain"),
+                        imported_names,
+                        imported_domains,
+                    ):
+                        continue
+                    if not row.get("discovered_date"):
+                        row["discovered_date"] = datetime.fromtimestamp(
+                            legacy_path.stat().st_mtime
+                        ).date().isoformat()
+                    if not row.get("status"):
+                        row["status"] = "New"
+                    rows.append(row)
+                    _add_row_to_index(row, imported_names, imported_domains)
+        except (OSError, csv.Error) as exc:
+            LOG.warning("Could not migrate legacy CSV %s: %s", legacy_path, exc)
+
+    return rows, _ensure_master_columns(fieldnames, rows), True
+
+
+def write_master_sheet(
+    rows: list[dict[str, Any]], fieldnames: list[str], path: Path
+) -> None:
+    temporary_path: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            newline="",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temporary_path = Path(handle.name)
+            writer = csv.DictWriter(
+                handle,
+                fieldnames=fieldnames,
+                extrasaction="ignore",
+                restval="",
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+        os.replace(temporary_path, path)
+    except OSError:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def target_to_master_row(target: dict[str, Any], discovered_date: str) -> dict[str, Any]:
+    company: CompanyEnrichment = target["company"]
+    row: dict[str, Any] = {
+        "company_name": company.company_name,
+        "domain": company.domain,
+        "company_intro": company.company_intro,
+        "funding_stage": company.funding_stage,
+        "latest_funding_date": company.latest_funding_date,
+        "funding_amount": company.funding_amount,
+        "funding_source_url": company.funding_source_url,
+        "sg_presence": company.sg_presence,
+        "hiring_roles": ", ".join(company.hiring_roles),
+        "careers_url": company.careers_url,
+        "why_now_hook": company.why_now_hook,
+        "freshness_check_url": _google_freshness_url(company.company_name),
+        "target_fit": target["fit_tier"],
+        "cold_email_draft": _email_draft(company, target["leads"]),
+        "discovered_date": discovered_date,
+        "status": "New",
+    }
+    for index in range(2):
+        lead = target["leads"][index] if index < len(target["leads"]) else {}
+        row.update(
+            {
+                f"lead_{index + 1}_name": lead.get("name", ""),
+                f"lead_{index + 1}_url": lead.get("url", ""),
+                f"lead_{index + 1}_highlight": lead.get("highlight", ""),
+            }
+        )
+    return row
 
 
 def run(args: argparse.Namespace) -> int:
@@ -917,6 +1090,22 @@ def run(args: argparse.Namespace) -> int:
     if not api_key:
         LOG.error("EXA_API_KEY is missing. Add it to your environment or a local .env file.")
         return 2
+
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    MASTER_CSV = args.out_dir / "targets_master.csv"
+    master_rows, master_fields, master_needs_write = load_master_sheet(MASTER_CSV)
+    if master_needs_write:
+        write_master_sheet(master_rows, master_fields, MASTER_CSV)
+        LOG.info(
+            "Initialized or migrated master sheet: %s (%d existing targets).",
+            MASTER_CSV,
+            len(master_rows),
+        )
+
+    master_names: set[str] = set()
+    master_domains: set[str] = set()
+    for row in master_rows:
+        _add_row_to_index(row, master_names, master_domains)
 
     cache = JsonCache(Path(".exa_cache.json"), refresh=args.refresh)
     search = ExaSearch(Exa(api_key), cache)
@@ -933,7 +1122,20 @@ def run(args: argparse.Namespace) -> int:
 
     candidates = discover_candidates(search, args.days)
     LOG.info("Discovered %d unique eligible company candidates.", len(candidates))
+    if not args.include_seen:
+        unseen_candidates = [
+            candidate
+            for candidate in candidates
+            if canonical_company_name(candidate["name"]) not in master_names
+        ]
+        skipped = len(candidates) - len(unseen_candidates)
+        if skipped:
+            LOG.info("Skipped %d already-known candidates before enrichment.", skipped)
+        candidates = unseen_candidates
+
     targets: list[dict[str, Any]] = []
+    current_run_names: set[str] = set()
+    current_run_domains: set[str] = set()
     for index, candidate in enumerate(candidates, start=1):
         if index > max_attempts or len(targets) >= args.limit:
             break
@@ -946,29 +1148,52 @@ def run(args: argparse.Namespace) -> int:
         company = enrich_company(search, candidate)
         if company is None:
             continue
+        if _matches_index(
+            company.company_name,
+            company.domain,
+            master_names | current_run_names,
+            master_domains | current_run_domains,
+        ):
+            LOG.info(
+                "Skipping duplicate after enrichment (before lead lookup): %s",
+                company.company_name,
+            )
+            continue
         leads = lookup_leads(search, company)
         tier = "Tier 1" if _is_target_company(company) else "Tier 2"
-        targets.append(
-            {
-                "company": company,
-                "leads": leads,
-                "fit_tier": tier,
-                "signals": candidate["signals"],
-            }
+        target = {
+            "company": company,
+            "leads": leads,
+            "fit_tier": tier,
+            "signals": candidate["signals"],
+        }
+        targets.append(target)
+        _add_row_to_index(
+            {"company_name": company.company_name, "domain": company.domain},
+            current_run_names,
+            current_run_domains,
         )
 
-    args.out_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
-    markdown_path = args.out_dir / f"targets_today_{timestamp}.md"
-    csv_path = args.out_dir / f"targets_{timestamp}.csv"
-    write_markdown(targets, markdown_path)
-    write_csv(targets, csv_path)
+    if targets:
+        discovered_date = datetime.now().date().isoformat()
+        master_rows.extend(target_to_master_row(target, discovered_date) for target in targets)
+        write_master_sheet(master_rows, master_fields, MASTER_CSV)
+        timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        markdown_path = args.out_dir / f"targets_today_{timestamp}.md"
+        write_markdown(targets, markdown_path)
+        LOG.info(
+            "Appended %d new targets to %s and wrote %s.",
+            len(targets),
+            MASTER_CSV,
+            markdown_path,
+        )
+    else:
+        LOG.info(
+            "No new targets found; master sheet unchanged and no Markdown file created."
+        )
+
     LOG.info(
-        "Wrote %d targets to %s and %s; Exa API calls this run: %d "
-        "(estimated maximum: %d).",
-        len(targets),
-        markdown_path,
-        csv_path,
+        "Exa API calls this run: %d (estimated maximum: %d).",
         search.api_calls,
         estimated_calls,
     )
